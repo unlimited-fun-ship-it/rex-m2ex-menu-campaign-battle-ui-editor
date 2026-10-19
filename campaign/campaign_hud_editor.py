@@ -1,62 +1,30 @@
 #!/usr/bin/env python3
 """
 RTW Campaign HUD Visual Assembler
-Dynamic output folders, text tabs, removed stats/help buttons, fixed minimap positioning.
+Main GUI Window.
 """
 
 import os
 import shutil
-import logging
+import json
 from datetime import datetime
+
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QFileDialog, QComboBox, QMessageBox,
     QGraphicsScene, QGraphicsView, QGraphicsRectItem, QFormLayout,
-    QGroupBox, QSpinBox, QSplitter, QSizePolicy, QGraphicsTextItem
+    QGroupBox, QSpinBox, QSplitter, QSizePolicy, QSlider, QCheckBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
 )
 from PyQt5.QtGui import QColor, QBrush, QPen, QFont, QPixmap, QImage, QPainter
 from PyQt5.QtCore import Qt, QRectF, QTimer
-from PIL import Image
+from PIL import Image, ImageDraw
 
+# Import our custom modules
+import config
 from sd_xml_parser import SDXMLReader
-
-# Setup Output Directory
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-NOW_STR = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, f"output_{NOW_STR}")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Setup Logging
-LOG_FILE = os.path.join(OUTPUT_DIR, "editor_log.txt")
-logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', filemode='w')
-logging.info(f"Starting RTW Campaign HUD Editor. Outputs will be saved to: {OUTPUT_DIR}")
-
-# ==============================================================================
-# EXACT PIXEL LAYOUT OF THE CAMPAIGN HUD (Based on 1024x768 resolution)
-# ==============================================================================
-HUD_LAYOUT = {
-    "STRAT_HUD_LEFT": (0, 587),
-    "STRAT_HUD_MIDDLE": (281, 621),
-    "STRAT_HUD_RIGHT": (743, 587),
-    
-    # Minimap + / - buttons placed at bottom left
-    "RADAR_BUTTON_PLUS": (15, 710),
-    "RADAR_BUTTON_MINUS": (15, 735),
-    
-    "BUILD_BUTTON_IMAGE": (760, 620),
-    "TRAIN_BUTTON_IMAGE": (760, 695),
-    "BUTTON_OUTER_RING_LRG": (880, 650),
-    "FACTION_LOGO_ALEMANNI": (897, 667),
-    "END_TURN_BUTTON_IMAGE": (970, 680),
-    "RADAR_DOT": (130, 680), 
-}
-
-DRAW_ORDER = [
-    "BUTTON_OUTER_RING_LRG", "FACTION_LOGO_ALEMANNI", 
-    "RADAR_BUTTON_PLUS", "RADAR_BUTTON_MINUS",
-    "BUILD_BUTTON_IMAGE", "TRAIN_BUTTON_IMAGE",
-    "END_TURN_BUTTON_IMAGE", "RADAR_DOT"
-]
+from canvas_items import DraggableSprite
+from asset_manager import AssetManager
 
 class HUDEditor(QMainWindow):
     def __init__(self):
@@ -65,10 +33,21 @@ class HUDEditor(QMainWindow):
         self.xml_readers = {} 
         self.selected_sprite = None
         self.sprite_rects = []
+        
+        self.active_layout = dict(config.DEFAULT_LAYOUT)
+        self.all_available_sprites = [] 
+        
+        # Initialize Asset Manager
+        self.assets = AssetManager()
+        
+        self.bg_image_path = None
+        self.bg_opacity = 100
+        self.bg_fade = 0
 
         self.setWindowTitle("RTW Campaign HUD Editor (Visual)")
-        self.resize(1400, 900)
+        self.resize(1600, 950)
         self._build_ui()
+        self.load_saved_layout()
 
     def _build_ui(self):
         central = QWidget()
@@ -100,11 +79,9 @@ class HUDEditor(QMainWindow):
         self.status_label.setStyleSheet("color: orange; font-weight: bold;")
         top_bar.addWidget(self.status_label)
 
-        # Date/Time Label
         self.time_label = QLabel()
         self.time_label.setStyleSheet("color: #333; font-weight: bold; padding-left: 10px;")
         top_bar.addWidget(self.time_label)
-
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_time)
         self.timer.start(1000)
@@ -113,10 +90,34 @@ class HUDEditor(QMainWindow):
         main_layout.addWidget(top_bar_widget)
 
         # --- MAIN SPLITTER ---
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
 
-        # Canvas
+        # 1. Left Panel: Texture Browser
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        
+        left_layout.addWidget(QLabel("<b>Texture Browser</b> (Double-click to add)"))
+        
+        self.texture_table = QTableWidget()
+        self.texture_table.setColumnCount(5)
+        self.texture_table.setHorizontalHeaderLabels(["Preview", "Name", "File", "X", "Y"])
+        self.texture_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.texture_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.texture_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.texture_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.texture_table.setSortingEnabled(True)
+        self.texture_table.verticalHeader().setVisible(False)
+        self.texture_table.itemDoubleClicked.connect(self.add_from_browser)
+        left_layout.addWidget(self.texture_table)
+        
+        self.main_splitter.addWidget(left_panel)
+
+        # 2. Center Panel: Canvas
         self.scene = QGraphicsScene()
         self.view = QGraphicsView(self.scene)
         self.view.setRenderHint(QPainter.Antialiasing)
@@ -125,19 +126,21 @@ class HUDEditor(QMainWindow):
         self.view.setSceneRect(0, 0, 1024, 768)
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
         self.view.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        splitter.addWidget(self.view)
+        self.main_splitter.addWidget(self.view)
 
-        # Right Panel
+        # 3. Right Panel: Properties & Controls
         right_panel = QWidget()
         right_panel.setMinimumWidth(350)
-        right_panel.setMaximumWidth(450)
+        right_panel.setMaximumWidth(500)
         right_layout = QVBoxLayout(right_panel)
 
-        self.asset_info = QLabel("No element selected.")
-        self.asset_info.setStyleSheet("color: gray; font-style: italic;")
-        right_layout.addWidget(self.asset_info)
+        self.chk_builder_mode = QCheckBox("HUD Builder Mode (Drag & Drop)")
+        self.chk_builder_mode.setChecked(True)
+        self.chk_builder_mode.setStyleSheet("font-weight: bold; color: #0055aa;")
+        self.chk_builder_mode.stateChanged.connect(self.render_hud)
+        right_layout.addWidget(self.chk_builder_mode)
 
-        self.props_group = QGroupBox("Element Crop Properties")
+        self.props_group = QGroupBox("Texture Crop Properties")
         self.props_group.setEnabled(False)
         form_layout = QFormLayout()
 
@@ -158,17 +161,48 @@ class HUDEditor(QMainWindow):
         form_layout.addRow("Crop Y:", self.y_spin)
         form_layout.addRow("Width:", self.w_spin)
         form_layout.addRow("Height:", self.h_spin)
+        
+        self.btn_remove = QPushButton("Remove Element from Viewer")
+        self.btn_remove.setStyleSheet("background-color: #D32F2F; color: white; font-weight: bold;")
+        self.btn_remove.clicked.connect(self.remove_selected_element)
+        form_layout.addRow(self.btn_remove)
 
         self.props_group.setLayout(form_layout)
         right_layout.addWidget(self.props_group)
 
-        # Output Folder Info
-        folder_info = QLabel(f"Saving outputs to:\n{os.path.basename(OUTPUT_DIR)}")
-        folder_info.setStyleSheet("color: #555; font-size: 10px; font-style: italic;")
-        right_layout.addWidget(folder_info)
+        bg_group = QGroupBox("Custom Background Image")
+        bg_layout = QFormLayout()
+        self.btn_load_bg = QPushButton("Load Background Image...")
+        self.btn_load_bg.clicked.connect(self.load_background)
+        bg_layout.addRow(self.btn_load_bg)
+        
+        self.bg_opacity_slider = QSlider(Qt.Horizontal)
+        self.bg_opacity_slider.setRange(0, 100)
+        self.bg_opacity_slider.setValue(100)
+        self.bg_opacity_slider.valueChanged.connect(self.update_bg_settings)
+        bg_layout.addRow("Opacity:", self.bg_opacity_slider)
+        
+        self.bg_fade_slider = QSlider(Qt.Horizontal)
+        self.bg_fade_slider.setRange(0, 100)
+        self.bg_fade_slider.setValue(0)
+        self.bg_fade_slider.valueChanged.connect(self.update_bg_settings)
+        bg_layout.addRow("Fade to Top:", self.bg_fade_slider)
+        bg_group.setLayout(bg_layout)
+        right_layout.addWidget(bg_group)
 
-        # Buttons
-        btn_export = QPushButton("📷 Export HUD as PNG (1024x768)")
+        layout_group = QGroupBox("Layout Memory")
+        layout_btn_layout = QHBoxLayout()
+        btn_save_layout = QPushButton("💾 Save Layout")
+        btn_save_layout.clicked.connect(self.save_layout)
+        layout_btn_layout.addWidget(btn_save_layout)
+        
+        btn_load_layout = QPushButton("📂 Load Layout")
+        btn_load_layout.clicked.connect(self.load_saved_layout)
+        layout_btn_layout.addWidget(btn_load_layout)
+        layout_group.setLayout(layout_btn_layout)
+        right_layout.addWidget(layout_group)
+
+        btn_export = QPushButton("📷 Export HUD as PNG")
         btn_export.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
         btn_export.clicked.connect(self.export_hud_image)
         right_layout.addWidget(btn_export)
@@ -183,12 +217,63 @@ class HUDEditor(QMainWindow):
         right_layout.addWidget(btn_save)
 
         right_layout.addStretch()
-        splitter.addWidget(right_panel)
-        splitter.setSizes([1050, 350])
-        main_layout.addWidget(splitter)
+        self.main_splitter.addWidget(right_panel)
+        self.main_splitter.setSizes([300, 850, 350])
+        main_layout.addWidget(self.main_splitter)
 
     def update_time(self):
         self.time_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def update_bg_settings(self):
+        self.bg_opacity = self.bg_opacity_slider.value()
+        self.bg_fade = self.bg_fade_slider.value()
+        self.render_hud()
+
+    def on_sprite_dragged(self, sprite_name, new_x, new_y):
+        if sprite_name in self.active_layout:
+            self.active_layout[sprite_name] = (new_x, new_y)
+
+    # ------------------------------------------------------------------
+    # Layout Memory
+    # ------------------------------------------------------------------
+    def save_layout(self):
+        try:
+            serializable_layout = {k: list(v) for k, v in self.active_layout.items()}
+            
+            # 1. Main persistent location
+            with open(config.LAYOUT_SAVE_FILE, 'w') as f:
+                json.dump(serializable_layout, f, indent=4)
+                
+            # 2. Current output folder
+            output_json_path = os.path.join(config.OUTPUT_DIR, "hud_layout.json")
+            with open(output_json_path, 'w') as f:
+                json.dump(serializable_layout, f, indent=4)
+                
+            # 3. Timestamped backup
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_json_name = f"hud_layout_{timestamp}.json"
+            backup_json_path = os.path.join(config.HUD_LAYOUTS_DIR, backup_json_name)
+            with open(backup_json_path, 'w') as f:
+                json.dump(serializable_layout, f, indent=4)
+                
+            QMessageBox.information(self, "Saved", 
+                f"Layout saved successfully!\n\n"
+                f"• Main file: {os.path.basename(config.LAYOUT_SAVE_FILE)}\n"
+                f"• Session output folder\n"
+                f"• hud_layouts/{backup_json_name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not save layout:\n{e}")
+
+    def load_saved_layout(self):
+        if os.path.exists(config.LAYOUT_SAVE_FILE):
+            try:
+                with open(config.LAYOUT_SAVE_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.active_layout = {k: tuple(v) for k, v in data.items()}
+                if self.game_root:
+                    self.render_hud()
+            except Exception as e:
+                print(f"Could not load layout: {e}")
 
     # ------------------------------------------------------------------
     # Loading Logic
@@ -198,114 +283,200 @@ class HUDEditor(QMainWindow):
         if folder and os.path.isdir(os.path.join(folder, "data")):
             self.game_root = folder
             self.folder_entry.setText(folder)
-            logging.info(f"Game root folder selected: {folder}")
             self.load_all_campaign_xmls()
 
     def load_all_campaign_xmls(self):
-        if not self.game_root:
-            return
+        if not self.game_root: return
             
         self.xml_readers.clear()
-        culture = self.culture_combo.currentText().lower()
-        logging.info(f"Loading campaign XMLs for culture: {culture}")
+        self.all_available_sprites.clear()
+        self.assets.clear_cache()
+        self.texture_table.setRowCount(0)
+        self.texture_table.setSortingEnabled(False)
         
+        culture = self.culture_combo.currentText().lower()
         required_xmls = ["strat3.sd.xml", "shared2.sd.xml", "radar.sd.xml"]
         loaded_count = 0
         
         for xml_name in required_xmls:
             paths = [
-                os.path.join(self.game_root, "data", "ui", culture, "interface", xml_name),
-                os.path.join(self.game_root, "data", "ui", culture, xml_name),
                 os.path.join(self.game_root, "data", "ui", "roman", "interface", xml_name),
+                os.path.join(self.game_root, "data", "ui", culture, "interface", xml_name),
                 os.path.join(self.game_root, "data", "ui", "roman", xml_name),
+                os.path.join(self.game_root, "data", "ui", culture, xml_name),
                 os.path.join(self.game_root, "data", "ui", xml_name)
             ]
             for p in paths:
                 if os.path.exists(p):
                     try:
-                        self.xml_readers[xml_name] = SDXMLReader(p)
-                        logging.info(f"Loaded XML: {p}")
+                        reader = SDXMLReader(p)
+                        self.xml_readers[xml_name] = reader
                         loaded_count += 1
+                        
+                        for sprite in reader.sprites:
+                            self.all_available_sprites.append((sprite, reader))
+                            
+                            row = self.texture_table.rowCount()
+                            self.texture_table.insertRow(row)
+                            
+                            page = reader.pages[sprite.page_index]
+                            tga_path = self.assets.get_image_path(self.game_root, culture, page.file_name)
+                            icon = self.assets.get_thumbnail(tga_path, sprite.x, sprite.y, sprite.w, sprite.h)
+                            
+                            item_name = QTableWidgetItem(sprite.name)
+                            item_name.setIcon(icon)
+                            item_name.setData(Qt.UserRole, (sprite, reader)) 
+                            self.texture_table.setItem(row, 0, item_name)
+                            
+                            item_file = QTableWidgetItem(os.path.basename(p))
+                            self.texture_table.setItem(row, 1, item_file)
+                            
+                            item_x = QTableWidgetItem()
+                            item_x.setData(Qt.DisplayRole, sprite.x)
+                            self.texture_table.setItem(row, 2, item_x)
+                            
+                            item_y = QTableWidgetItem()
+                            item_y.setData(Qt.DisplayRole, sprite.y)
+                            self.texture_table.setItem(row, 3, item_y)
+                            
                     except Exception as e:
-                        logging.error(f"Error loading {p}: {e}")
+                        pass
                     break
                     
+        self.texture_table.setSortingEnabled(True)
+        self.texture_table.setColumnWidth(0, 180)
+        self.texture_table.setColumnHidden(4, True)
+        
         if loaded_count > 0:
-            self.status_label.setText(f"Loaded {loaded_count} HUD files successfully.")
+            self.status_label.setText(f"Loaded {loaded_count} HUD files.")
             self.status_label.setStyleSheet("color: green; font-weight: bold;")
             self.render_hud()
         else:
-            self.status_label.setText("Error: Could not find campaign HUD XMLs.")
+            self.status_label.setText("Error: Missing HUD XMLs.")
             self.status_label.setStyleSheet("color: red; font-weight: bold;")
 
-    def get_image_path(self, filename):
-        if "radar_map" in filename.lower():
-            primary_dir = os.path.join(self.game_root, "data", "world", "maps", "campaign", "imperial_campaign")
-            if os.path.isdir(primary_dir):
-                for candidate in ["radar_map2.tga", "radar_map1.tga"]:
-                    for f in os.listdir(primary_dir):
-                        if f.lower() == candidate:
-                            return os.path.join(primary_dir, f)
+    def load_background(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Background Image", "", "Images (*.png *.jpg *.bmp *.tga)")
+        if file_path:
+            self.bg_image_path = file_path
+            self.render_hud()
 
-        culture = self.culture_combo.currentText().lower()
-        search_dirs = [
-            os.path.join(self.game_root, "data", "ui", culture, "interface"),
-            os.path.join(self.game_root, "data", "ui", culture),
-            os.path.join(self.game_root, "data", "ui", "roman", "interface"),
-            os.path.join(self.game_root, "data", "ui", "roman"),
-            os.path.join(self.game_root, "data", "ui")
-        ]
+    # ------------------------------------------------------------------
+    # Dynamic Layout Logic
+    # ------------------------------------------------------------------
+    def add_from_browser(self, item):
+        data = item.data(Qt.UserRole)
+        if not data: return
+        sprite, reader = data
+        sprite_name = sprite.name
         
-        for d in search_dirs:
-            if os.path.isdir(d):
-                for f in os.listdir(d):
-                    if f.lower() == filename.lower():
-                        return os.path.join(d, f)
-        return None
+        if sprite_name not in self.active_layout:
+            self.active_layout[sprite_name] = (100, 100) 
+            self.render_hud()
+        
+        for r in self.sprite_rects:
+            if hasattr(r, 'sprite_data') and r.sprite_data.name == sprite_name:
+                r.setSelected(True)
+                break
+
+    def remove_selected_element(self):
+        if self.selected_sprite and self.selected_sprite.name in self.active_layout:
+            del self.active_layout[self.selected_sprite.name]
+            self.selected_sprite = None
+            self.props_group.setEnabled(False)
+            self.render_hud()
 
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
+    def draw_sprite_by_name(self, name, x, y):
+        for sprite, reader in self.all_available_sprites:
+            if sprite.name == name:
+                culture = self.culture_combo.currentText().lower()
+                tga_path = self.assets.get_image_path(self.game_root, culture, reader.pages[sprite.page_index].file_name)
+                if tga_path:
+                    try:
+                        img = self.assets.load_image(tga_path)
+                        crop = img.crop((sprite.x, sprite.y, sprite.x + sprite.w, sprite.y + sprite.h))
+                        data = crop.tobytes("raw", "RGBA")
+                        qim = QImage(data, crop.width, crop.height, QImage.Format_RGBA8888)
+                        pix_item = self.scene.addPixmap(QPixmap.fromImage(qim))
+                        pix_item.setPos(x, y)
+                        return sprite.w, sprite.h
+                    except Exception: pass
+        return 0, 0
+
     def render_hud(self):
         self.scene.clear()
         self.sprite_rects.clear()
         self.props_group.setEnabled(False)
+        culture = self.culture_combo.currentText().lower()
 
-        # 1. Dark Green Background
-        self.scene.addRect(0, 0, 1024, 768, QPen(Qt.NoPen), QBrush(QColor("#2b3b22")))
-        
-        sprites_to_draw = []
-        for xml_name, reader in self.xml_readers.items():
-            for sprite in reader.sprites:
-                if sprite.name in HUD_LAYOUT:
-                    sprites_to_draw.append((sprite, reader))
+        is_builder = self.chk_builder_mode.isChecked()
 
-        # 2. Marble Panels
-        backgrounds = ["STRAT_HUD_LEFT", "STRAT_HUD_MIDDLE", "STRAT_HUD_RIGHT"]
-        for sprite, reader in sprites_to_draw:
-            if sprite.name in backgrounds:
-                draw_x, draw_y = HUD_LAYOUT[sprite.name]
-                tga_path = self.get_image_path(reader.pages[sprite.page_index].file_name)
+        # 1. Base Background (Custom Image or Solid Green)
+        if self.bg_image_path and os.path.exists(self.bg_image_path):
+            try:
+                bg_img = Image.open(self.bg_image_path).convert("RGBA")
+                bg_img = bg_img.resize((1024, 768), Image.Resampling.LANCZOS)
+                
+                alpha = bg_img.split()[3]
+                alpha = alpha.point(lambda p: p * (self.bg_opacity / 100.0))
+                bg_img.putalpha(alpha)
+                
+                if self.bg_fade > 0:
+                    fade_mask = Image.new('L', (1024, 768), 0)
+                    draw = ImageDraw.Draw(fade_mask)
+                    fade_height = int(768 * (self.bg_fade / 100.0))
+                    for y in range(768):
+                        if y > 768 - fade_height:
+                            alpha_val = 255
+                        else:
+                            alpha_val = int(255 * (y / max(1, (768 - fade_height))))
+                        draw.line([(0, y), (1024, y)], fill=alpha_val)
+                    
+                    bg_alpha = bg_img.split()[3]
+                    new_alpha = Image.composite(Image.new('L', (1024, 768), 0), bg_alpha, fade_mask)
+                    bg_img.putalpha(new_alpha)
+
+                data = bg_img.tobytes("raw", "RGBA")
+                qim = QImage(data, bg_img.width, bg_img.height, QImage.Format_RGBA8888)
+                self.scene.addPixmap(QPixmap.fromImage(qim))
+            except Exception as e:
+                self.scene.addRect(0, 0, 1024, 768, QPen(Qt.NoPen), QBrush(QColor("#2b3b22")))
+        else:
+            self.scene.addRect(0, 0, 1024, 768, QPen(Qt.NoPen), QBrush(QColor("#2b3b22")))
+
+        # 2. Draw Main HUD Panels (Backgrounds)
+        for sprite, reader in self.all_available_sprites:
+            if sprite.name in self.active_layout and sprite.name in config.BACKGROUNDS:
+                draw_x, draw_y = self.active_layout[sprite.name]
+                tga_path = self.assets.get_image_path(self.game_root, culture, reader.pages[sprite.page_index].file_name)
+                
                 if tga_path:
                     try:
-                        img = Image.open(tga_path).convert("RGBA")
+                        img = self.assets.load_image(tga_path)
                         crop = img.crop((sprite.x, sprite.y, sprite.x + sprite.w, sprite.y + sprite.h))
                         data = crop.tobytes("raw", "RGBA")
                         qim = QImage(data, crop.width, crop.height, QImage.Format_RGBA8888)
                         pix_item = self.scene.addPixmap(QPixmap.fromImage(qim))
                         pix_item.setPos(draw_x, draw_y)
                     except Exception: pass
-                
-                rect = QGraphicsRectItem(draw_x, draw_y, sprite.w, sprite.h)
+
+                rect = DraggableSprite(draw_x, draw_y, sprite.w, sprite.h, sprite.name, self.on_sprite_dragged)
                 rect.setPen(QPen(Qt.NoPen))
-                rect.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
                 rect.sprite_data = sprite
                 rect.reader_ref = reader 
+                
+                if is_builder:
+                    rect.setFlag(QGraphicsRectItem.ItemIsMovable, True)
+                    rect.setCursor(Qt.OpenHandCursor)
+                    
                 self.scene.addItem(rect)
                 self.sprite_rects.append(rect)
 
-        # 3. Minimap (Positioned 30, 605, size 210x150)
-        map_path = self.get_image_path("radar_map2.tga")
+        # 3. Minimap (Drawn on top of Left Panel)
+        map_path = self.assets.get_image_path(self.game_root, culture, "radar_map2.tga")
         if map_path:
             try:
                 img = Image.open(map_path).convert("RGBA")
@@ -313,29 +484,24 @@ class HUDEditor(QMainWindow):
                 data = img.tobytes("raw", "RGBA")
                 qim = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
                 pix_item = self.scene.addPixmap(QPixmap.fromImage(qim))
-                pix_item.setPos(30, 605) 
-            except Exception as e: logging.error(f"Map render error: {e}")
+                pix_item.setPos(31, 593) 
+            except Exception: pass
 
-        # 4. Draw Text Tabs
-        tab_font = QFont("Times New Roman", 12, QFont.Bold)
-        # Draw the tabs starting at x=284, width ~70 each
-        for text, x_pos in [("Army", 294), ("Town", 364), ("Agents", 434)]:
-            text_item = self.scene.addText(text, tab_font)
-            text_item.setDefaultTextColor(QColor("#332211")) # Dark brown for visibility on marble
-            # Center the text roughly
-            text_item.setPos(x_pos, 592)
+        # 4. Draw Standard Elements (Buttons, etc)
+        sprites_to_draw = []
+        for sprite, reader in self.all_available_sprites:
+            if sprite.name in self.active_layout and sprite.name in config.DRAW_ORDER:
+                sprites_to_draw.append((sprite, reader))
 
-        # 5. Other Elements (Buttons, Radar Dot)
-        others = [s for s in sprites_to_draw if s[0].name not in backgrounds]
-        others.sort(key=lambda item: DRAW_ORDER.index(item[0].name) if item[0].name in DRAW_ORDER else 999)
+        sprites_to_draw.sort(key=lambda item: config.DRAW_ORDER.index(item[0].name) if item[0].name in config.DRAW_ORDER else 999)
 
-        for sprite, reader in others:
-            draw_x, draw_y = HUD_LAYOUT[sprite.name]
-            tga_path = self.get_image_path(reader.pages[sprite.page_index].file_name)
+        for sprite, reader in sprites_to_draw:
+            draw_x, draw_y = self.active_layout[sprite.name]
+            tga_path = self.assets.get_image_path(self.game_root, culture, reader.pages[sprite.page_index].file_name)
             
             if tga_path:
                 try:
-                    img = Image.open(tga_path).convert("RGBA")
+                    img = self.assets.load_image(tga_path)
                     crop = img.crop((sprite.x, sprite.y, sprite.x + sprite.w, sprite.y + sprite.h))
                     data = crop.tobytes("raw", "RGBA")
                     qim = QImage(data, crop.width, crop.height, QImage.Format_RGBA8888)
@@ -343,17 +509,71 @@ class HUDEditor(QMainWindow):
                     pix_item.setPos(draw_x, draw_y)
                 except Exception: pass
 
-            rect = QGraphicsRectItem(draw_x, draw_y, sprite.w, sprite.h)
+            rect = DraggableSprite(draw_x, draw_y, sprite.w, sprite.h, sprite.name, self.on_sprite_dragged)
             rect.setPen(QPen(Qt.NoPen))
-            rect.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
             rect.sprite_data = sprite
             rect.reader_ref = reader 
+            
+            if is_builder:
+                rect.setFlag(QGraphicsRectItem.ItemIsMovable, True)
+                rect.setCursor(Qt.OpenHandCursor)
+                
             self.scene.addItem(rect)
             self.sprite_rects.append(rect)
 
+        # 5. ASSEMBLE TABS dynamically
+        tab_data = [
+            ("TAB_ARMY_ASSEMBLY", "Army", True),
+            ("TAB_TOWN_ASSEMBLY", "Town", False),
+            ("TAB_AGENTS_ASSEMBLY", "Agents", False)
+        ]
+
+        tab_font = QFont("Times New Roman", 11, QFont.Bold)
+
+        for tab_key, text, is_selected in tab_data:
+            if tab_key in self.active_layout:
+                tx, ty = self.active_layout[tab_key]
+                
+                if is_selected:
+                    l_name, m_name, r_name = "HUD_TEXT_TAB_LEFT_SELECTED", "HUD_TEXT_TAB_MID_SELECTED", "HUD_TEXT_TAB_RIGHT_SELECTED"
+                else:
+                    l_name, m_name, r_name = "HUD_TEXT_TAB_LEFT", "HUD_TEXT_TAB_MID", "HUD_TEXT_TAB_RIGHT"
+                
+                lw, lh = self.draw_sprite_by_name(l_name, tx, ty)
+                mw, mh = self.draw_sprite_by_name(m_name, tx + lw, ty)
+                rw, rh = self.draw_sprite_by_name(r_name, tx + lw + mw, ty)
+                
+                total_w = lw + mw + rw
+                total_h = max(lh, mh, rh) if max(lh, mh, rh) > 0 else 25
+                
+                if total_w > 0:
+                    text_item = self.scene.addText(text, tab_font)
+                    text_item.setDefaultTextColor(QColor("#221100") if not is_selected else QColor("#000000"))
+                    
+                    text_rect = text_item.boundingRect()
+                    text_x = tx + (total_w - text_rect.width()) / 2
+                    text_y = ty + (total_h - text_rect.height()) / 2 - 2
+                    text_item.setPos(text_x, text_y)
+                
+                rect = DraggableSprite(tx, ty, total_w, total_h, tab_key, self.on_sprite_dragged)
+                rect.setPen(QPen(Qt.NoPen))
+                
+                class DummySprite:
+                    def __init__(self, name, w, h):
+                        self.name, self.x, self.y, self.w, self.h = name, 0, 0, w, h
+                
+                rect.sprite_data = DummySprite(tab_key, total_w, total_h)
+                rect.reader_ref = None
+                
+                if is_builder:
+                    rect.setFlag(QGraphicsRectItem.ItemIsMovable, True)
+                    rect.setCursor(Qt.OpenHandCursor)
+                    
+                self.scene.addItem(rect)
+                self.sprite_rects.append(rect)
+
         self.scene.selectionChanged.connect(self.on_selection_changed)
-        if self.selected_sprite is None:
-            self.view.fitInView(self.view.sceneRect(), Qt.KeepAspectRatio)
+        self.view.fitInView(self.view.sceneRect(), Qt.KeepAspectRatio)
 
     # ------------------------------------------------------------------
     # Selection and editing
@@ -365,57 +585,53 @@ class HUDEditor(QMainWindow):
         if not selected_items:
             self.props_group.setEnabled(False)
             self.selected_sprite = None
-            self.asset_info.setText("No element selected.")
-            self.asset_info.setStyleSheet("color: gray; font-style: italic;")
             return
 
-        # Ensure we are clicking a UI sprite box, not the text items we created
         rect_item = None
         for item in selected_items:
             if isinstance(item, QGraphicsRectItem):
                 rect_item = item
                 break
                 
-        if not rect_item or not hasattr(rect_item, 'sprite_data'):
-            return
+        if not rect_item or not hasattr(rect_item, 'sprite_data'): return
 
         self.selected_sprite = rect_item.sprite_data
         self.current_reader = rect_item.reader_ref
+        
         self.props_group.setEnabled(True)
         self.name_label.setText(self.selected_sprite.name)
-        self.source_label.setText(os.path.basename(self.current_reader.filepath))
-        self.asset_info.setText(f"Editing: {self.selected_sprite.name}")
-        self.asset_info.setStyleSheet("color: lime; font-weight: bold;")
+        
+        if self.current_reader:
+            self.source_label.setText(os.path.basename(self.current_reader.filepath))
+            for spin in [self.x_spin, self.y_spin, self.w_spin, self.h_spin]: spin.blockSignals(True)
+            self.x_spin.setValue(self.selected_sprite.x)
+            self.y_spin.setValue(self.selected_sprite.y)
+            self.w_spin.setValue(self.selected_sprite.w)
+            self.h_spin.setValue(self.selected_sprite.h)
+            for spin in [self.x_spin, self.y_spin, self.w_spin, self.h_spin]: spin.blockSignals(False)
+        else:
+            self.source_label.setText("Assembled Tab")
+            for spin in [self.x_spin, self.y_spin, self.w_spin, self.h_spin]: spin.blockSignals(True)
+            self.x_spin.setValue(0)
+            self.y_spin.setValue(0)
+            self.w_spin.setValue(self.selected_sprite.w)
+            self.h_spin.setValue(self.selected_sprite.h)
+            for spin in [self.x_spin, self.y_spin, self.w_spin, self.h_spin]: spin.blockSignals(False)
 
         rect_item.setPen(QPen(QColor("red"), 2))
-        for spin in [self.x_spin, self.y_spin, self.w_spin, self.h_spin]: spin.blockSignals(True)
-        self.x_spin.setValue(self.selected_sprite.x)
-        self.y_spin.setValue(self.selected_sprite.y)
-        self.w_spin.setValue(self.selected_sprite.w)
-        self.h_spin.setValue(self.selected_sprite.h)
-        for spin in [self.x_spin, self.y_spin, self.w_spin, self.h_spin]: spin.blockSignals(False)
 
     def update_sprite(self):
-        if not self.selected_sprite: return
+        if not self.selected_sprite or not self.current_reader: return
         self.selected_sprite.x = self.x_spin.value()
         self.selected_sprite.y = self.y_spin.value()
         self.selected_sprite.w = self.w_spin.value()
         self.selected_sprite.h = self.h_spin.value()
         self.render_hud()
-        for r in self.sprite_rects:
-            if hasattr(r, 'sprite_data') and r.sprite_data == self.selected_sprite:
-                r.setPen(QPen(QColor("red"), 2))
-                r.setSelected(True)
-                break
 
     # ------------------------------------------------------------------
     # Exporting and Saving
     # ------------------------------------------------------------------
     def export_hud_image(self):
-        if not self.xml_readers:
-            QMessageBox.warning(self, "Warning", "No HUD loaded to export.")
-            return
-
         for r in self.sprite_rects: r.setPen(QPen(Qt.NoPen))
 
         rect = QRectF(0, 0, 1024, 768)
@@ -426,31 +642,22 @@ class HUDEditor(QMainWindow):
         self.scene.render(painter, rect, rect)
         painter.end()
 
-        default_path = os.path.join(OUTPUT_DIR, "campaign_hud_preview.png")
+        default_path = os.path.join(config.OUTPUT_DIR, "campaign_hud_preview.png")
         file_path, _ = QFileDialog.getSaveFileName(self, "Save HUD Image", default_path, "PNG Image (*.png)")
         
         if file_path:
             image.save(file_path)
-            logging.info(f"Exported HUD image to: {file_path}")
-            QMessageBox.information(self, "Exported", f"HUD image successfully saved to:\n{file_path}")
-
-        selected_items = self.scene.selectedItems()
-        if selected_items: 
-            for item in selected_items:
-                if isinstance(item, QGraphicsRectItem):
-                    item.setPen(QPen(QColor("red"), 2))
-                    break
+            QMessageBox.information(self, "Exported", f"HUD image saved to:\n{file_path}")
 
     def take_program_screenshot(self):
         default_name = f"program_screenshot_{datetime.now().strftime('%H%M%S')}.png"
-        default_path = os.path.join(OUTPUT_DIR, default_name)
+        default_path = os.path.join(config.OUTPUT_DIR, default_name)
         
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Program Screenshot", default_path, "PNG Image (*.png)")
         
         if file_path:
             pixmap = self.grab()
             pixmap.save(file_path)
-            logging.info(f"Saved program screenshot to: {file_path}")
             QMessageBox.information(self, "Saved", f"Program screenshot saved to:\n{file_path}")
 
     def save_all_xmls(self):
@@ -462,8 +669,6 @@ class HUDEditor(QMainWindow):
                 shutil.copy2(reader.filepath, backup)
                 reader.save()
                 saved_files.append(xml_name)
-                logging.info(f"Saved changes to: {reader.filepath}")
-            QMessageBox.information(self, "Saved", f"Successfully saved changes to:\n{', '.join(saved_files)}")
+            QMessageBox.information(self, "Saved", f"Saved changes to:\n{', '.join(saved_files)}")
         except Exception as e:
-            logging.error(f"Could not save XML files: {e}")
             QMessageBox.critical(self, "Error", f"Could not save file:\n{e}")
