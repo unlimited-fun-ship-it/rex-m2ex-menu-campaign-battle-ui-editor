@@ -1,6 +1,6 @@
 A vibe-coded attempt at an editor for the REX & M2EX menu, campaign, and battle ui. 
 
-I've made a version of this program which is just for editing the in-campaign ui. Look in the campaign folder and then choose any one of the folders "functional style", "imperative style", or "oop style" adn then run the main.py file inside the folder that you choose.
+I've made a version of this program which is just for editing the in-campaign ui. It can't really edit it yet (I think) but it's a start to it. Look in the campaign folder and then choose any one of the folders "functional style", "imperative style", or "oop style" adn then run the main.py file inside the folder that you choose.
 
 You can absolutely fork it, and improve upon it.
 
